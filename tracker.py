@@ -3,6 +3,7 @@ import json
 import os
 from collections import defaultdict
 import numpy as np
+import open3d as o3d
 
 
 class GaussianTracker:
@@ -19,6 +20,9 @@ class GaussianTracker:
         self.iteration = 0
         self.active_ids = set()
 
+        '''位置，颜色相关'''
+        self.prev_rgb_dict = defaultdict(list)
+        self.prev_pos_dict = defaultdict(list)
         self.z_history = defaultdict(list)  # 每个高斯ID维护一段Z历史
         self.z_window_size = 10
     def initialize(self):
@@ -28,90 +32,154 @@ class GaussianTracker:
 
     def update(self):
         """
-        每次调用，记录当前所有高斯球参数和状态
+        优化版 update 函数：
+        - 每10轮记录一次完整日志，其余只更新状态（节省内存）
+        - 使用 torch.no_grad() 避免显存膨胀
         """
+        import math
+        import numpy as np
+        import torch
+        from collections import defaultdict
+        from scipy.spatial import cKDTree
+        from utils.sh_utils import sh_to_rgb
+
         self.iteration += 1
-        current_ids = set(self.model._ids.cpu().tolist())
-        positions = self.model.get_xyz.detach().cpu()
-        scales = self.model.get_scaling.detach().cpu()
-        alphas = self.model.get_opacity.detach().cpu()
-        hit_counts = self.model._hit_counts.cpu()
+        full_log = (self.iteration % 100 == 0)
 
-        # === 维护全局 z 值分布 ===
-        ids = self.model._ids.cpu().tolist()
-        zs = positions[:, 2].cpu().numpy()
+        with torch.no_grad():
+            ids_tensor = self.model._ids.detach()
+            ids = ids_tensor.cpu().tolist()
+            current_ids = set(ids)
 
-        # 为每个ID记录Z值历史
+            positions = self.model.get_xyz.detach().cpu()
+            scales = self.model.get_scaling.detach().cpu()
+            alphas = self.model.get_opacity.detach().cpu()
+            hit_counts = self.model._hit_counts.detach().cpu()
+
+            features_dc = self.model._features_dc.detach().transpose(1, 2)
+            features_rest = self.model._features_rest.detach().transpose(1, 2)
+            features_all = torch.cat([features_dc, features_rest], dim=2)
+
+            dirs = torch.tensor([0.0, 0.0, 1.0], device=features_all.device).repeat(features_all.shape[0], 1)
+            coeff_num = features_all.shape[-1]
+            deg = int(math.sqrt(coeff_num)) - 1
+            rgbs = sh_to_rgb(features_all, dirs, deg).detach().cpu()
+
+        # 维护Z历史
+        zs = positions[:, 2].numpy()
         for gid, z in zip(ids, zs):
             self.z_history[gid].append(z)
             if len(self.z_history[gid]) > self.z_window_size:
                 self.z_history[gid].pop(0)
-        # =========================
 
-        # 动态发现新增ID，初始化日志
+        # 发现新 ID
         new_ids = current_ids - self.active_ids
         for new_id in new_ids:
             self.logs[new_id] = []
-
-            #初始化时刻状态日志
-            idx = (self.model._ids == new_id).nonzero(as_tuple=True)[0].item()
+            idx = (ids_tensor == new_id).nonzero(as_tuple=True)[0].item()
             record = self._make_log_record(new_id, idx, positions, scales, alphas, hit_counts, initial=True)
             self.logs[new_id].append(record)
 
-        # 判断剔除ID（之前存在但不在模型里）
         removed_ids = self.active_ids - current_ids
-
         for rid in removed_ids:
-            #标记为已剔除，保存一条状态
-            self.logs[rid].append({
-                "iteration": self.iteration,
-                "status": "removed"
-            })
-        
-        # 更新当前活跃ID集
-        self.active_ids = current_ids
-        '''计算状态相关'''
-        # 计算是否在表面示例（可根据实际需求调整）
-        on_surface = (alphas.squeeze() > 0.05)  # 简单阈值举例
-        # 判断膨胀、突然上升、低命中等逻辑，可以用自定义函数实现
-        is_expanded = self._check_expanded(scales)
-        sudden_rise = self._check_sudden_rise(scales)
-        low_hit = self._check_low_hits(hit_counts,self.iteration)
-        # 计算剔除原因示例
-        # prune_reasons = self._get_prune_reasons(alphas, scales)
+            self.logs[rid].append({"iteration": self.iteration, "status": "removed"})
 
-        # 遍历所有当前活跃ID，记录状态
-        for i, gid in enumerate(self.model._ids.cpu().tolist()):
+        self.active_ids = current_ids
+
+        gid_to_color_delta = {}
+        gid_to_pos_delta = {}
+        shape_ratios = {}
+        neighbor_dists = {}
+        pos_dict = {}
+
+        for i, gid in enumerate(ids):
+            rgb = rgbs[i]
+            pos = positions[i]
+            alpha = float(alphas[i])
+            scale = scales[i]
+
+            prev_rgb = self.prev_rgb_dict.get(gid, rgb)
+            prev_pos = self.prev_pos_dict.get(gid, pos)
+
+            color_delta = torch.norm(rgb - prev_rgb).item()
+            pos_delta = torch.norm(pos - prev_pos).item()
+
+            self.prev_rgb_dict[gid] = rgb
+            self.prev_pos_dict[gid] = pos
+
+            if not full_log:
+                continue  # 非记录周期只做状态更新
+
+            gid_to_color_delta[gid] = color_delta
+            gid_to_pos_delta[gid] = pos_delta
+            pos_dict[gid] = pos.tolist()
+
+            volume = float(torch.prod(scale).item() + 1e-6)
+            density = alpha / volume
+            strength = alpha * density
+
+            try:
+                # sigma = self.model._scaling[i].detach().cpu().numpy()
+                sigma = scale
+                vals = np.abs(sigma)
+                shape_ratio = float(np.max(vals) / max(np.min(vals), 1e-6))
+            except:
+                shape_ratio = 1.0
+            shape_ratios[gid] = shape_ratio
+            neighbor_dists[gid] = None
+
             record = {
                 "iteration": self.iteration,
-                "pos": positions[i].tolist(),
-                "scale": scales[i].tolist(),
-                "alpha": float(alphas[i]),
-                # "hit_count": int(hit_counts[i]),
-                # "on_surface": bool(on_surface[i]),
-                # "is_expanded": bool(is_expanded[i]),
-                # "sudden_rise": bool(sudden_rise[i]),
-                # "long_term_low_hit": bool(low_hit[i]),
-                "prune_reason": self._get_prune_reason(gid, alphas[i], scales[i], z, hit_counts[i], self.iteration)
+                "pos": pos.tolist(),
+                "scale": scale.tolist(),
+                "alpha": alpha,
+                "color_delta": color_delta,
+                "pos_delta": pos_delta,
+                "strength": strength,
+                "shape_ratio": shape_ratio,
+                "prune_reason": self._get_prune_reason(gid, alpha, scale, zs[i], hit_counts[i], strength, self.iteration)
             }
             self.logs[gid].append(record)
-        # print(f"[Tracker] Iter {self.iteration} - Num Gaussians: {len(self.model._ids)}")
-        # print(f"Positions shape: {positions.shape}")
-        # print(f"Scales shape: {scales.shape}")
-        # print(f"Alphas shape: {alphas.shape}")
-        # print(f"Hit counts shape: {hit_counts.shape}")
+            if len(self.logs[gid]) > 20:
+                self.logs[gid].pop(0)
 
-        # 定时保存日志
-        if self.iteration % self.log_interval == 0:
+        # 点间距离计算
+        if full_log and len(pos_dict) > 1:
+            positions_arr = np.array(list(pos_dict.values()))
+            gids = list(pos_dict.keys())
+            tree = cKDTree(positions_arr)
+            distances, _ = tree.query(positions_arr, k=min(9, len(positions_arr)))
+            for idx, gid in enumerate(gids):
+                neighbor_dists[gid] = float(np.mean(distances[idx][1:]))
+
+        # 记录可疑点
+        if full_log:
             self.suspicious = defaultdict(list)
+            num_points = len(gid_to_color_delta)
+            topk = max(1, int(0.05 * num_points))
+            topk_color_ids = sorted(gid_to_color_delta, key=gid_to_color_delta.get, reverse=True)[:topk]
+            topk_pos_ids = sorted(gid_to_pos_delta, key=gid_to_pos_delta.get, reverse=True)[:topk]
+
             for gid in self.active_ids:
                 last_log = self.logs[gid][-1]
-                
-                # 根据是否有可疑的原因
+                if "prune_reason" not in last_log or not isinstance(last_log["prune_reason"], list):
+                    last_log["prune_reason"] = []
+
+                if gid in topk_color_ids:
+                    last_log["prune_reason"].append("color_jitter")
+                if gid in topk_pos_ids:
+                    last_log["prune_reason"].append("fast_motion")
+                if shape_ratios.get(gid, 1.0) > 10.0:
+                    last_log["prune_reason"].append("elongated")
+                if neighbor_dists.get(gid, 0.0) > 0.5:
+                    last_log["prune_reason"].append("isolated")
+
                 if last_log.get("prune_reason"):
                     self.suspicious[gid].append(last_log)
-            self.save_logs()
+                    if len(self.suspicious[gid]) > 3:
+                        self.suspicious[gid].pop(0)
 
+            self.save_logs()
     def _make_log_record(self, gid, idx, positions, scales, alphas, hit_counts, initial=False):
         return {
             "iteration": self.iteration,
@@ -120,24 +188,15 @@ class GaussianTracker:
             "alpha": float(alphas[idx]),
             "hit_count": int(hit_counts[idx]),
             "status": "initial" if initial else "active"
-        }
-    def _check_expanded(self, scales):
-        # 示例：如果scale任一维超过阈值，则认为膨胀
-        threshold = 1.5  # 举例阈值
-        return (scales > threshold).any(dim=1)
-
-    def _check_sudden_rise(self, scales):
-        # 需要保存历史scale比较，简化起见这里返回全False
-        return torch.zeros(scales.size(0), dtype=torch.bool)
-
-    def _check_low_hits(self, hit_counts: torch.Tensor, iteration: int):
-        # 返回一个布尔Tensor，表示哪些高斯命中数低
-        return (hit_counts < 5) & (iteration > 100)
-    def _get_prune_reason(self, gid, alpha, scale, z, hit_count, iteration):
+         }
+    
+    def _get_prune_reason(self, gid, alpha, scale, z, hit_count,strength, iteration):
         reasons = []
+        if strength > 150 and hit_count < 3:
+            reasons.append("fake_floater")
         if alpha < 0.01:
             reasons.append("transparency")
-        if max(scale) > 0.1:  # 按需调整
+        if max(scale) > 3:  # 按需调整
             reasons.append("overscaled")
         z_values = self.z_history.get(gid, [])
         if len(z_values) >= 3:
@@ -149,6 +208,43 @@ class GaussianTracker:
             reasons.append("low_visibility")
         
         return reasons
+    def visualize_suspicious(self):
+        """
+        使用 Open3D 可视化当前所有 suspicious 高斯球。
+        仅展示带有可疑记录的点，颜色根据异常类型简单区分。
+        """
+        if not self.suspicious:
+            print("当前无可疑高斯球。")
+            return
+
+        vis_points = []
+        vis_colors = []
+
+        
+
+        for gid, logs in self.suspicious.items():
+            # 取最新一条记录
+            record = logs[-1]
+            pos = record.get("pos", None)
+            if pos is None:
+                continue
+
+            # 默认颜色hong色
+            color = [1.0, 0.0, 0.0]
+
+            vis_points.append(pos)
+            vis_colors.append(color)
+
+        if len(vis_points) == 0:
+            print("当前无可疑高斯球有效位置可视化。")
+            return
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(vis_points)
+        pcd.colors = o3d.utility.Vector3dVector(vis_colors)
+
+        # 打开窗口显示
+        o3d.visualization.draw_geometries([pcd], window_name="Suspicious Gaussians Visualization")
 
     def save_logs(self):
         def _to_serializable(obj):

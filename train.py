@@ -206,6 +206,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             '''add new'''
             # 调用tracker更新
             tracker.update()
+            # if iteration % 10 == 0:
+            #     tracker.visualize_suspicious()
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
