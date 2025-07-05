@@ -430,7 +430,7 @@ class GaussianModel:
 
         self._ids = torch.cat((self._ids, new_ids), dim=0)
         self._hit_counts = torch.cat((self._hit_counts, new_hits), dim=0)
-        print("adadada")
+       
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]

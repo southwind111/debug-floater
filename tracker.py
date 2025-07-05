@@ -120,10 +120,11 @@ class GaussianTracker:
 
             try:
                 # sigma = self.model._scaling[i].detach().cpu().numpy()
-                sigma = scale
+                sigma = scale.tolist()
                 vals = np.abs(sigma)
                 shape_ratio = float(np.max(vals) / max(np.min(vals), 1e-6))
-            except:
+            except Exception as e:
+                print(f"[Warning] shape_ratio fallback due to: {e}, scale={scale}")
                 shape_ratio = 1.0
             shape_ratios[gid] = shape_ratio
             neighbor_dists[gid] = None
@@ -203,7 +204,7 @@ class GaussianTracker:
             z_mean = np.mean(z_values)
             z_std = np.std(z_values) + 1e-6
             if z > z_mean + 3 * z_std:
-                return "sudden_rise"
+                reasons.append("sudden_rise")
         if hit_count < 5 and iteration > 100:
             reasons.append("low_visibility")
         
