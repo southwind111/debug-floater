@@ -19,6 +19,16 @@ class GaussianTracker:
         os.makedirs(self.out_dir, exist_ok=True)
         self.iteration = 0
         self.active_ids = set()
+        self.prune_weights = {"color_jitter":2.0,
+                              "fast_motion":1.0,
+                              "elongate":1.0,
+                              "isolated":1.0,
+                              "fake_floater":1.0,
+                              "transparency":1.0,
+                              "overscaled":1.0,
+                              "sudden_rise":1.0,
+                              "low_visibility":1.0}
+
 
         '''位置，颜色相关'''
         self.prev_rgb_dict = defaultdict(list)
@@ -44,7 +54,7 @@ class GaussianTracker:
         from utils.sh_utils import sh_to_rgb
 
         self.iteration += 1
-        full_log = (self.iteration % 100 == 0)
+        full_log = (self.iteration % 10 == 0)
 
         with torch.no_grad():
             ids_tensor = self.model._ids.detach()
@@ -56,6 +66,7 @@ class GaussianTracker:
             alphas = self.model.get_opacity.detach().cpu()
             hit_counts = self.model._hit_counts.detach().cpu()
 
+            #计算相关颜色
             features_dc = self.model._features_dc.detach().transpose(1, 2)
             features_rest = self.model._features_rest.detach().transpose(1, 2)
             features_all = torch.cat([features_dc, features_rest], dim=2)
@@ -157,10 +168,11 @@ class GaussianTracker:
         if full_log:
             self.suspicious = defaultdict(list)
             num_points = len(gid_to_color_delta)
-            topk = max(1, int(0.05 * num_points))
+            topk = max(1, int(0.01 * num_points))
             topk_color_ids = sorted(gid_to_color_delta, key=gid_to_color_delta.get, reverse=True)[:topk]
             topk_pos_ids = sorted(gid_to_pos_delta, key=gid_to_pos_delta.get, reverse=True)[:topk]
-
+            topk_shape_ids = sorted(shape_ratios, key=shape_ratios.get, reverse=True)[:topk]
+            topk_neighbor_ids = sorted(neighbor_dists, key=neighbor_dists.get, reverse=True)[:topk]
             for gid in self.active_ids:
                 last_log = self.logs[gid][-1]
                 if "prune_reason" not in last_log or not isinstance(last_log["prune_reason"], list):
@@ -170,15 +182,21 @@ class GaussianTracker:
                     last_log["prune_reason"].append("color_jitter")
                 if gid in topk_pos_ids:
                     last_log["prune_reason"].append("fast_motion")
-                if shape_ratios.get(gid, 1.0) > 10.0:
+                if gid in topk_shape_ids:
                     last_log["prune_reason"].append("elongated")
-                if neighbor_dists.get(gid, 0.0) > 0.5:
+                if gid in topk_neighbor_ids:
                     last_log["prune_reason"].append("isolated")
 
-                if last_log.get("prune_reason"):
-                    self.suspicious[gid].append(last_log)
-                    if len(self.suspicious[gid]) > 3:
-                        self.suspicious[gid].pop(0)
+                #计算可疑得分
+                reasons = last_log["prune_reason"]
+                if reasons:
+                    weights = [self.prune_weights.get(r, 1.0) for r in reasons]
+                    suspicious_score = sum(weights)
+                    last_log["suspicious_score"] = suspicious_score
+                    if suspicious_score >= 1.0:
+                        self.suspicious[gid].append(last_log)
+                        if len(self.suspicious[gid]) > 3:
+                            self.suspicious[gid].pop(0)
 
             self.save_logs()
     def _make_log_record(self, gid, idx, positions, scales, alphas, hit_counts, initial=False):
@@ -205,7 +223,9 @@ class GaussianTracker:
             z_std = np.std(z_values) + 1e-6
             if z > z_mean + 3 * z_std:
                 reasons.append("sudden_rise")
-        if hit_count < 5 and iteration > 100:
+        recent_hit_counts = [log.get("hit_count", 0) for log in self.logs.get(gid, [])[-10:]]
+        low_hits = sum(hc < 5 for hc in recent_hit_counts)
+        if len(recent_hit_counts) == 10 and low_hits >= 8:
             reasons.append("low_visibility")
         
         return reasons
