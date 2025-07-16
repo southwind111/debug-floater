@@ -49,6 +49,7 @@ class ModelParams(ParamGroup):
         self.sh_degree = 3
         self._source_path = ""
         self._model_path = ""
+        self._target_mask_path = "" #! 添加mask路径
         self._images = "images"
         self._depths = ""
         self._resolution = -1
@@ -88,7 +89,7 @@ class OptimizationParams(ParamGroup):
         self.exposure_lr_delay_mult = 0.0
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
-        self.densification_interval = 100
+        self.densification_interval = 500 #! 设置每500次迭代进行一次稠密化，否则生成的模型太大，计算量越来越大（原先是100）
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000

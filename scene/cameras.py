@@ -17,7 +17,9 @@ from utils.general_utils import PILtoTorch
 import cv2
 
 class Camera(nn.Module):
-    def __init__(self, resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, invdepthmap,
+    def __init__(self, resolution, cropped_resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, mask, invdepthmap,
+                 origin_width, origin_height,
+                 left, upper, right, lower,
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
                  train_test_exp = False, is_test_dataset = False, is_test_view = False
@@ -39,8 +41,9 @@ class Camera(nn.Module):
             print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device" )
             self.data_device = torch.device("cuda")
 
-        resized_image_rgb = PILtoTorch(image, resolution)
+        resized_image_rgb = PILtoTorch(image, cropped_resolution) #! 根据resolution缩放图片
         gt_image = resized_image_rgb[:3, ...]
+        
         self.alpha_mask = None
         if resized_image_rgb.shape[0] == 4:
             self.alpha_mask = resized_image_rgb[3:4, ...].to(self.data_device)
@@ -54,8 +57,13 @@ class Camera(nn.Module):
                 self.alpha_mask[..., self.alpha_mask.shape[-1] // 2:] = 0
 
         self.original_image = gt_image.clamp(0.0, 1.0).to(self.data_device)
-        self.image_width = self.original_image.shape[2]
-        self.image_height = self.original_image.shape[1]
+        #todo 记录target_mask，将target_mask转换为bool类型
+        self.target_mask = PILtoTorch(mask, cropped_resolution).to(dtype=torch.bool) if mask is not None else None
+        # self.image_width = self.original_image.shape[2] #! 将缩放后的图片宽高赋值给image_width和image_height
+        # self.image_height = self.original_image.shape[1]
+        self.image_width = resolution[0] #! 将缩放后的图片宽高赋值给image_width和image_height
+        self.image_height = resolution[1]
+        self.mask_bbox = (left, upper, right, lower) #! 记录mask的包围框
 
         self.invdepthmap = None
         self.depth_reliable = False

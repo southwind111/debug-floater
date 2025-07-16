@@ -1,4 +1,4 @@
-name: gaussian_splatting
+name: debug_floater
 channels:
   - pytorch
   - conda-forge
@@ -18,3 +18,4 @@ dependencies:
     - submodules/fused-ssim
     - opencv-python
     - joblib
+
