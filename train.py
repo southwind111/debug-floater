@@ -12,7 +12,7 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import l1_loss, l1_loss_origin, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -73,6 +73,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
+    #!增加一组渲染照片
+    os.makedirs(os.path.join(dataset.model_path, "rendered"), exist_ok=True)
+    from torchvision import transforms
+    to_pil = transforms.ToPILImage()
+
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
@@ -124,13 +129,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             gaussians._hit_counts[mask] += 1
         '''add new'''
+
+        #!新增的rendered渲染
+        if iteration % 100 == 0:
+            image_tensor = ((image.cpu().clamp(0,1)*255).byte().permute(1,2,0).contiguous().numpy())
+            image_pil = to_pil(image_tensor)
+            image_pil.save(os.path.join(dataset.model_path, "rendered", f"iter_{iteration}_view_{viewpoint_cam.image_name}.png"))
+        #!裁剪image
+        left, upper, right, lower = viewpoint_cam.mask_bbox
+        image = image[:, upper:lower, left:right]
+
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
             image *= alpha_mask
 
         # Loss
+        #! 计算loss的时候传入mask
+        #! cam对象需要包含有效区域包围框坐标
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
+        target_mask = viewpoint_cam.target_mask.cuda() if viewpoint_cam.target_mask is not None else None
+        #Ll1 = l1_loss(image, gt_image)
+        Ll1 = l1_loss_origin(image, gt_image, target_mask)
         if FUSED_SSIM_AVAILABLE:
             ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         else:
@@ -197,14 +216,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 else:
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
-            '''add new'''
-            # 调用tracker更新
+
+            #! 调用tracker更新
             tracker.update()
             if iteration % 7000 == 0 :
                 tracker.visualize_suspicious()
+
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+    from torchvision.transforms import transforms
+
+    to_pil = transforms.ToPILImage()
+    all_cameras = scene.getTrainCameras()
+    os.makedirs(os.path.join(dataset.model_path, "final_gaussian_images"), exist_ok=True)
+    for camera in all_cameras:
+        camera_name = camera.image_name
+        render_set = render(camera, gaussians, pipe, background)
+        image = render_set["render"]
+        render_image_tensor = ((image.cpu().clamp(0, 1) * 255).byte().permute(1, 2, 0).contiguous().numpy())
+        render_image_pil = to_pil(render_image_tensor)
+        render_image_pil.save(os.path.join(dataset.model_path, "final_gaussian_images", camera_name + ".png"))
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -239,23 +272,31 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         torch.cuda.empty_cache()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
-
+        #!增加了关于mask image的内容
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                    #!用来裁剪image的
+                    left, upper, right, lower = viewpoint.mask_bbox 
+                    image = image[:, upper:lower, left:right]
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    mask_image = torch.clamp(viewpoint.target_mask.to("cuda"), 0.0, 1.0) if viewpoint.target_mask is not None else None
                     if train_test_exp:
                         image = image[..., image.shape[-1] // 2:]
                         gt_image = gt_image[..., gt_image.shape[-1] // 2:]
+                        mask_image = mask_image[..., mask_image.shape[-1] // 2:]
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
+                    #!对应的修改
+                    #l1_test += l1_loss(image, gt_image).mean().double()
+                    l1_test += l1_loss(image, gt_image, mask_image).mean().double()
+                    #psnr_test += psnr(image, gt_image).mean().double()
+                    psnr_test += psnr(image, gt_image, mask_image).mean().double()
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
@@ -278,8 +319,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1_000, 2_000, 3_000, 7_000, 30_000])
+    parser.add_argument("--save_iterations",nargs="+",type=int,default=[1_000, 2_000, 3_000, 7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])

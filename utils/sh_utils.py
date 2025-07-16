@@ -127,8 +127,7 @@ def sh_to_rgb(sh_coeffs, dirs, deg):
         rgb: Tensor, shape [N, 3]
     """
     rgb_channels = []
-    for c in range(3):
-        # 提取该通道SH系数，变为 [N, 1, (deg+1)^2]
+    for c in range(3): #! 提取该通道SH系数，变为 [N, 1, (deg+1)^2]
         sh_c = sh_coeffs[:, c, :].unsqueeze(1)
         val_c = eval_sh(deg, sh_c, dirs)  # [N, 1]
         rgb_channels.append(val_c.squeeze(-1))  # [N]
