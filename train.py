@@ -225,7 +225,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-
+    #!保存渲染图像以作报告说明
     from torchvision.transforms import transforms
 
     to_pil = transforms.ToPILImage()
