@@ -120,15 +120,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         '''add new,avoid affecting the gradient'''
         with torch.no_grad():
             visible_ids = gaussians._ids[visibility_filter.squeeze()]
-            # 找到这些ID在 _ids 中对应的索引位置
-            idx_positions = []
-            for vid in visible_ids.tolist():
-                pos = (gaussians._ids == vid).nonzero(as_tuple=True)[0]
-                if pos.numel() > 0:
-                    idx_positions.append(pos.item())
+            mask = torch.isin(gaussians._ids,visible_ids)
 
-            idx_positions = torch.tensor(idx_positions, device=gaussians._ids.device)
-            gaussians._hit_counts[idx_positions] += 1
+            gaussians._hit_counts[mask] += 1
         '''add new'''
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
@@ -206,8 +200,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             '''add new'''
             # 调用tracker更新
             tracker.update()
-            # if iteration % 10 == 0:
-            #     tracker.visualize_suspicious()
+            if iteration % 7000 == 0 :
+                tracker.visualize_suspicious()
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")

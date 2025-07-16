@@ -13,7 +13,7 @@ import os
 import random
 import json
 from utils.system_utils import searchForMaxIteration
-from scene.dataset_readers import sceneLoadTypeCallbacks
+from scene.dataset_readers import sceneLoadTypeCallbacks,calcuRGBMask
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
@@ -37,10 +37,20 @@ class Scene:
                 self.loaded_iter = load_iteration
             print("Loading trained model at iteration {}".format(self.loaded_iter))
 
+        if args.target_mask_path is not None:
+            RGB_mask_output_path = os.path.join(args.model_path, "RGB_masks")
+            os.makedirs(RGB_mask_output_path, exist_ok=True)
+            source_img_path = os.path.join(args.source_path, args.images)
+            calcuRGBMask(args.target_mask_path, source_img_path, RGB_mask_output_path)
+
         self.train_cameras = {}
         self.test_cameras = {}
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
+            #! 在读取scene的时候，加入mask_path参数
+            args.target_mask_path = None if args.target_mask_path == "" else args.target_mask_path
+            #! 读取、保存点云
+            #! 读取cam_info
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, args.eval, args.train_test_exp)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")

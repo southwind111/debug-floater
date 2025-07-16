@@ -3,13 +3,14 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
 
 import os
+from shlex import join
 import sys
 from PIL import Image
 from typing import NamedTuple
@@ -19,8 +20,11 @@ from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
 import numpy as np
 import json
 from pathlib import Path
+import torch
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
+import open3d as o3d
+import cv2
 from scene.gaussian_model import BasicPointCloud
 
 class CameraInfo(NamedTuple):
@@ -33,9 +37,13 @@ class CameraInfo(NamedTuple):
     image_path: str
     image_name: str
     depth_path: str
+    mask_path:str
+    mask_name:str
+    mask: np.array
     width: int
     height: int
     is_test: bool
+    focal:np.array
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -68,7 +76,7 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, depths_folder, test_cam_names_list):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, masks_folder, depths_folder, test_cam_names_list):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
@@ -76,13 +84,17 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         sys.stdout.write("Reading camera {}/{}".format(idx+1, len(cam_extrinsics)))
         sys.stdout.flush()
 
+        #! 提取key对应的相机内外参
         extr = cam_extrinsics[key]
+        #! 提取key对应的相机内参
         intr = cam_intrinsics[extr.camera_id]
         height = intr.height
         width = intr.width
 
         uid = intr.id
+        #! 从世界坐标系到相机坐标系的旋转矩阵R
         R = np.transpose(qvec2rotmat(extr.qvec))
+        #! 从世界坐标系到相机坐标系的平移矩阵T
         T = np.array(extr.tvec)
 
         if intr.model=="SIMPLE_PINHOLE":
@@ -92,6 +104,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         elif intr.model=="PINHOLE":
             focal_length_x = intr.params[0]
             focal_length_y = intr.params[1]
+            #! 通过焦距和图像宽高计算视场角Field of View
             FovY = focal2fov(focal_length_y, height)
             FovX = focal2fov(focal_length_x, width)
         else:
@@ -108,9 +121,21 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         image_path = os.path.join(images_folder, extr.name)
         image_name = extr.name
         depth_path = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png") if depths_folder != "" else ""
-
+        if masks_folder is not None:
+            if not os.path.exists(masks_folder):
+                assert False, f"Masks folder {masks_folder} does not exist"
+            mask_path  = os.path.join(masks_folder, extr.name)
+            mask_name = extr.name
+            mask = Image.open(mask_path) #! 在cam对象构造的时候计算包围框
+        else:
+            mask_path = None
+            mask_name = None
+            mask = None
+        
+        #! gt_image和mask的读取推迟到cam对象的组装中
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
                               image_path=image_path, image_name=image_name, depth_path=depth_path,
+                              mask_path = mask_path, mask_name = mask_name, mask=mask, focal=intr.params,
                               width=width, height=height, is_test=image_name in test_cam_names_list)
         cam_infos.append(cam_info)
 
@@ -130,7 +155,7 @@ def storePly(path, xyz, rgb):
     dtype = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
             ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
             ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]
-    
+
     normals = np.zeros_like(xyz)
 
     elements = np.empty(xyz.shape[0], dtype=dtype)
@@ -142,7 +167,150 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
+
+def mask_pointcloud_with_voxelgrid(voxelgrid, pointcloud):
+    #! 检查点云中有哪些点在体素内
+    mask = np.array(voxelgrid.check_if_included(pointcloud.points))
+
+    #! 保留在体素内的点云
+    pointcloud.points = o3d.utility.Vector3dVector(np.asarray(pointcloud.points)[mask])
+    pointcloud.colors = o3d.utility.Vector3dVector(np.asarray(pointcloud.colors)[mask])
+    pointcloud.normals = o3d.utility.Vector3dVector(np.asarray(pointcloud.normals)[mask])
+
+
+def getCamO3dParam(camInfo):
+    W = camInfo.width
+    H = camInfo.height
+    focal = camInfo.focal
+    
+    extrinsic = torch.tensor(getWorld2View2(camInfo.R, camInfo.T)).numpy()
+    intrinsic = o3d.camera.PinholeCameraIntrinsic(W, H, focal[0], focal[1], W/2-0.5, H/2-0.5)
+    param = o3d.camera.PinholeCameraParameters()
+    param.extrinsic = extrinsic
+    param.intrinsic = intrinsic
+    
+    return param
+
+def extractPointCloud(point_cloud, train_cam_info, path):
+    points = point_cloud.points
+    num_points = points.shape[0]
+    final_mask = np.ones(num_points, dtype=bool)
+    for idx, caminfo in enumerate(train_cam_info):
+        R = caminfo.R
+        T = caminfo.T.reshape((3, 1))
+        mask = caminfo.mask
+        mask_array = np.array(mask)
+        height, width = caminfo.height, caminfo.width
+
+        fx = (width / 2) / np.tan(caminfo.FovX / 2)
+        fy = (height / 2) / np.tan(caminfo.FovY / 2)
+        cx = width / 2
+        cy = height / 2
+
+        points_cam = (R.T @ points.T + T).T
+
+        x = points_cam[:, 0]
+        y = points_cam[:, 1]
+        z = points_cam[:, 2]
+        z[z == 0] = 1e-6  #! 避免除0错误
+
+        u = (fx * x / z + cx).astype(np.int32)
+        v = (fy * y / z + cy).astype(np.int32)
+
+        valid = (u >= 0) & (u < width) & (v >= 0) & (v < height)
+        current_mask = np.zeros(num_points, dtype=bool)
+
+        valid_indices = np.where(valid)[0]  #! 先筛选在图像范围内的点
+        mask_nonzero = np.where(mask_array > 0)
+
+        point_image = np.zeros((height, width), dtype=np.uint8)
+
+        for i in valid_indices:
+            #! 将有效点云投影像素绘制到图像上
+            point_image[v[i], u[i]] = 1
+            if v[i] in mask_nonzero[0] and u[i] in mask_nonzero[1]:
+                current_mask[i] = True
+
+        #! 检测如果mask有效区域触及边界了，直接将current_mask置为True，即不进行裁剪
+        min_v, max_v = np.min(mask_nonzero[0]), np.max(mask_nonzero[0])
+        min_u, max_u = np.min(mask_nonzero[1]), np.max(mask_nonzero[1])
+        if min_v == 0 or max_v == height - 1 or min_u == 0 or max_u == width - 1:
+            current_mask = np.ones(num_points, dtype=bool)
+
+        img = Image.fromarray(point_image * 255)
+        os.makedirs(os.path.join(path, "point_img"), exist_ok=True)
+        img.save(os.path.join(path, "point_img", "{}".format(caminfo.image_name)))
+        former_point_num = np.count_nonzero(final_mask)
+        final_mask &= current_mask  #! 取交集
+        print(
+            f"{former_point_num} -> {np.count_nonzero(final_mask)} cropped by mask: {caminfo.image_name}"
+        )
+
+    filtered_points = points[final_mask]
+    filtered_colors = point_cloud.colors[final_mask]
+    filtered_normals = point_cloud.normals[final_mask]
+
+    return BasicPointCloud(points=filtered_points, colors=filtered_colors, normals=filtered_normals)
+
+def calcuRGBMask(target_mask_path, source_path, output_path):
+    print(f"Saving RGB masks to {output_path}, cropped by {target_mask_path}, source from {source_path}")
+    for filename in os.listdir(source_path):
+        if not filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+            print(f"Skipping non-image file: {filename}")
+            continue
+        #! 读取原图像
+        mask_path = os.path.join(target_mask_path, filename)
+        image_path = os.path.join(source_path, filename)
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+        if image.shape[2] == 4:
+            image = image[:,:,:3]
+        
+        if len(mask.shape) == 3:
+            mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+            
+        mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)[1]    
+        # cv2.imwrite(os.path.join(output_path, "mask_" + filename), mask)
+        
+        #! 创建白色背景图像
+        white_bg = np.full_like(image, 255)
+        masked = cv2.bitwise_and(image, image, mask=mask)
+        inverse_mask = cv2.bitwise_not(mask)
+        background = cv2.bitwise_and(white_bg, white_bg, mask=inverse_mask)
+        final_image = cv2.add(masked, background)
+        cv2.imwrite(os.path.join(output_path, filename), final_image)
+        print(f"RGB mask {filename} saved...")
+
+def extractPointCloudUsingVoxel(point_cloud_path, train_cam_info, path):
+    point_cloud = o3d.io.read_point_cloud(point_cloud_path)
+    #todo voxel_size待确定
+    origin_voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(point_cloud, voxel_size=0.005)
+
+    for idx, caminfo in enumerate(train_cam_info):
+        mask = caminfo.mask #! 需要用到完整掩码
+        mask_array = np.array(mask)
+        if not np.any(mask_array > 0):
+            print(f"Skip mask {caminfo.image_name}, no valid pixels")
+            continue
+        mask_nonzero = np.where(mask_array > 0)
+        min_v, max_v = np.min(mask_nonzero[0]), np.max(mask_nonzero[0])
+        min_u, max_u = np.min(mask_nonzero[1]), np.max(mask_nonzero[1])
+        if min_v == 0 or max_v == caminfo.height - 1 or min_u == 0 or max_u == caminfo.width - 1:
+            print(f"Skip mask {caminfo.image_name}")
+            continue
+        print(f"Carving voxels using mask {caminfo.image_name}, voxels num : {len(origin_voxel_grid.get_voxels())}")
+        mask_array = np.expand_dims(mask_array, axis=-1)
+        mask_array_contiguous = np.ascontiguousarray(mask_array.astype(np.float32))
+        mask_o3d = o3d.geometry.Image(mask_array_contiguous)
+        o3dParam = getCamO3dParam(caminfo)
+        origin_voxel_grid.carve_silhouette(mask_o3d, o3dParam)
+
+    mask_pointcloud_with_voxelgrid(origin_voxel_grid, point_cloud)
+    return BasicPointCloud(points=np.asarray(point_cloud.points),
+                           colors=np.asarray(point_cloud.colors),
+                           normals=np.asarray(point_cloud.normals))
+
+def readColmapSceneInfo(path, images, depths, mask_path, eval, train_test_exp, llffhold=8):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -191,10 +359,16 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
         test_cam_names_list = []
 
     reading_dir = "images" if images == None else images
+    #! 组装cam_infos，包括R、T、FovY、FovX、image_path、image_name、mask、mask_path等
     cam_infos_unsorted = readColmapCameras(
-        cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, depths_params=depths_params,
+        cam_extrinsics=cam_extrinsics, 
+        cam_intrinsics=cam_intrinsics, 
+        depths_params=depths_params,
         images_folder=os.path.join(path, reading_dir), 
-        depths_folder=os.path.join(path, depths) if depths != "" else "", test_cam_names_list=test_cam_names_list)
+        masks_folder=mask_path,
+        depths_folder=os.path.join(path, depths) if depths != "" else "", 
+        test_cam_names_list=test_cam_names_list
+    )
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
@@ -214,7 +388,20 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
         storePly(ply_path, xyz, rgb)
     try:
         pcd = fetchPly(ply_path)
-    except:
+        #! 如果有mask_path,使用mask对场景点云进行裁剪
+        if mask_path is not None and os.path.exists(mask_path):
+            print(f"Extracting point cloud using masks from {mask_path}")
+            # pcd = extractPointCloud(pcd, train_cam_infos, path)
+            pcd = extractPointCloudUsingVoxel(ply_path, train_cam_infos, path)
+            #! 裁剪后将点云存储回数据集下
+            #! 修改ply_path
+            cropped_point_cloud_path = os.path.join(path, "sparse/0/cropped_points3D.ply")
+            storePly(cropped_point_cloud_path, pcd.points, pcd.colors)
+            ply_path = cropped_point_cloud_path
+        else:
+            print("Using original point cloud")
+    except Exception as e:
+        print(f"Error fetching PLY file: {e}")
         pcd = None
 
     scene_info = SceneInfo(point_cloud=pcd,
