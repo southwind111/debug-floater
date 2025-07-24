@@ -41,6 +41,10 @@ class Scene:
         self.test_cameras = {}
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
+            #! 在读取scene的时候，加入mask_path参数
+            args.target_mask_path = None if args.target_mask_path == "" else args.target_mask_path
+            #! 读取、保存点云
+            #! 读取cam_info
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, args.eval, args.train_test_exp)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")

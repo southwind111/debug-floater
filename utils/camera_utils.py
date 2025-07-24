@@ -14,12 +14,33 @@ import numpy as np
 from utils.graphics_utils import fov2focal
 from PIL import Image
 import cv2
+import os
 
 WARNED = False
 
 def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset):
-    image = Image.open(cam_info.image_path)
+    #! 读取image和mask，在Camera构造函数里面对其进行处理
+    #! 这里需要对mask和image进行裁剪
+    # image = Image.open(cam_info.image_path)
+    image = Image.open(os.path.join(args.model_path, "RGB_masks", cam_info.image_name))
+    orig_w, orig_h = image.size
+    left, upper, right, lower = 0, 0, image.width, image.height
+    if cam_info.mask_path is not None:
+        mask = Image.open(cam_info.mask_path).convert("L")
+        #! 计算包围框
+        bbox = mask.getbbox()
+        if bbox is not None:
+            left, upper, right, lower = bbox
+            
+        #! 裁剪mask
+        mask = mask.crop((left, upper, right, lower))
+        
+        #! 裁剪image
+        image = image.crop((left, upper, right, lower))
+    else:
+        mask = None
 
+    cropped_w, cropped_h = image.size
     if cam_info.depth_path != "":
         try:
             if is_nerf_synthetic:
@@ -39,9 +60,9 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
     else:
         invdepthmap = None
         
-    orig_w, orig_h = image.size
-    if args.resolution in [1, 2, 4, 8]:
+    if args.resolution in [1, 2, 4, 8]: #! resolution_scale默认1
         resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
+        cropped_resolution = round(cropped_w/(resolution_scale * args.resolution)), round(cropped_h/(resolution_scale * args.resolution))
     else:  # should be a type that converts to float
         if args.resolution == -1:
             if orig_w > 1600:
@@ -55,14 +76,14 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
                 global_down = 1
         else:
             global_down = orig_w / args.resolution
-    
-
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
-    return Camera(resolution, colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
+    return Camera(resolution, cropped_resolution, colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, depth_params=cam_info.depth_params,
-                  image=image, invdepthmap=invdepthmap,
+                  image=image, mask=mask, invdepthmap=invdepthmap,
+                  origin_width=orig_w, origin_height=orig_h,
+                  left=left, upper=upper, right=right, lower=lower,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device,
                   train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test)
 
